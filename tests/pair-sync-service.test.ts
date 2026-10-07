@@ -587,3 +587,412 @@ describe("PairSyncService", () => {
     expect(checkpoints.at(-1)?.entries["b.pdf"]).toBeUndefined();
   });
 });
+
+describe("PairSyncService text mapping", () => {
+  const text = (value: string): Uint8Array => new TextEncoder().encode(value);
+
+  const addIn = (
+    cloud: MemoryPairCloud,
+    directoryId: string,
+    fileName: string,
+    content: Uint8Array,
+  ): CloudFile => {
+    const file = remoteFile(
+      `remote-${directoryId}-${fileName}`,
+      fileName,
+      content,
+    );
+    file.directoryId = directoryId;
+    cloud.items.set(file.id, file);
+    cloud.bytes.set(file.id, Uint8Array.from(content));
+    return file;
+  };
+
+  const remoteFileNames = (cloud: MemoryPairCloud): string[] =>
+    [...cloud.items.values()]
+      .filter((item) => !item.isFolder)
+      .map((item) => item.fileName)
+      .sort();
+
+  const uploadedNames = (cloud: MemoryPairCloud): string[] =>
+    cloud.uploadFile.mock.calls.map(([, fileName]) => fileName);
+
+  const initializedBaseline = (): PairBaseline => ({
+    ...emptyPairBaseline(),
+    initialized: true,
+  });
+
+  const pairedEntry = (
+    baseline: PairBaseline,
+    localRelativePath: string,
+    remoteRelativePath: string,
+    file: CloudFile,
+    content: Uint8Array,
+  ): PairBaseline => {
+    baseline.entries[localRelativePath] = {
+      localRelativePath,
+      remoteRelativePath,
+      remoteId: file.id,
+      directoryId: file.directoryId,
+      fileName: file.fileName,
+      checksum: checksum(content),
+    };
+    return baseline;
+  };
+
+  it("downloads a Remote .txt file as a Vault .md file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const content = text("- [ ] task\n");
+    cloud.add("project.txt", content);
+
+    const result = await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(result.downloaded).toEqual(["Document/Obsidian/project.txt"]);
+    expect(vault.files.get(localPath("project.md"))).toEqual(content);
+    expect(vault.files.has(localPath("project.txt"))).toBe(false);
+    expect(result.baseline.entries["project.md"]).toMatchObject({
+      localRelativePath: "project.md",
+      remoteRelativePath: "project.txt",
+      fileName: "project.txt",
+    });
+  });
+
+  it("uploads a new Vault .md file as a Remote .txt file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const content = text("# Inbox\n");
+    vault.files.set(localPath("Inbox.md"), content);
+
+    const result = await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(uploadedNames(cloud)).toEqual(["Inbox.txt"]);
+    expect(result.uploaded).toEqual(["Document/Obsidian/Inbox.txt"]);
+    expect(remoteFileNames(cloud)).toEqual(["Inbox.txt"]);
+    expect(result.baseline.entries["Inbox.md"]).toMatchObject({
+      remoteRelativePath: "Inbox.txt",
+    });
+  });
+
+  it("replaces the Remote .txt file when the Vault .md file is edited", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const before = text("- [ ] a\n");
+    const after = text("- [x] a\n");
+    const file = cloud.add("area.txt", before);
+    vault.files.set(localPath("area.md"), after);
+
+    const result = await service(vault, cloud).reconcile(
+      baselineFor(file, before, "area.md"),
+    );
+
+    expect(cloud.replaceFile).toHaveBeenCalledWith(file, after);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+    expect(result.uploaded).toEqual(["Document/Obsidian/area.txt"]);
+    expect(cloud.bytes.get(file.id)).toEqual(after);
+    expect(remoteFileNames(cloud)).toEqual(["area.txt"]);
+  });
+
+  it("writes a Remote .txt edit to the Vault .md file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const before = text("- [ ] a\n");
+    const after = text("- [ ] a\n- [ ] b\n");
+    const file = cloud.add("area.txt", after);
+    vault.files.set(localPath("area.md"), before);
+
+    const result = await service(vault, cloud).reconcile(
+      baselineFor(file, before, "area.md"),
+    );
+
+    expect(result.downloaded).toEqual(["Document/Obsidian/area.txt"]);
+    expect(vault.files.get(localPath("area.md"))).toEqual(after);
+    expect(vault.files.has(localPath("area.txt"))).toBe(false);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+    expect(cloud.replaceFile).not.toHaveBeenCalled();
+  });
+
+  it("recycles the Remote .txt file when the unchanged Vault .md file is deleted", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const content = text("old\n");
+    const file = cloud.add("old.txt", content);
+
+    const result = await service(vault, cloud).reconcile(
+      baselineFor(file, content, "old.md"),
+    );
+
+    expect(cloud.recycleItem).toHaveBeenCalledWith(file);
+    expect(result.deletedRemote).toEqual(["Document/Obsidian/old.txt"]);
+  });
+
+  it("uploads a Vault .md rename under the renamed Remote .txt name", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const content = text("same\n");
+    const file = cloud.add("before.txt", content);
+    vault.files.set(localPath("after.md"), content);
+
+    const result = await service(vault, cloud).reconcile(
+      baselineFor(file, content, "before.md"),
+    );
+
+    expect(uploadedNames(cloud)).toEqual(["after.txt"]);
+    expect(cloud.recycleItem).toHaveBeenCalledWith(file);
+    expect(result.movedRemote).toEqual([
+      "Document/Obsidian/before.txt → Document/Obsidian/after.txt",
+    ]);
+    expect(Object.keys(result.baseline.entries)).toEqual(["after.md"]);
+  });
+
+  it("maps .txt files inside nested Remote folders", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const gtd = cloud.addDirectory("gtd");
+    const archive = folder("remote-gtd-archive", gtd.id, "archive");
+    cloud.items.set(archive.id, archive);
+    const project = text("project\n");
+    const old = text("old\n");
+    addIn(cloud, gtd.id, "project.txt", project);
+    addIn(cloud, archive.id, "2025.txt", old);
+
+    const result = await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(vault.files.get(localPath("gtd/project.md"))).toEqual(project);
+    expect(vault.files.get(localPath("gtd/archive/2025.md"))).toEqual(old);
+    expect(result.downloaded.sort()).toEqual([
+      "Document/Obsidian/gtd/archive/2025.txt",
+      "Document/Obsidian/gtd/project.txt",
+    ]);
+    expect(result.baseline.entries["gtd/archive/2025.md"]).toMatchObject({
+      remoteRelativePath: "gtd/archive/2025.txt",
+    });
+  });
+
+  it("uploads a new nested Vault .md file as .txt into the matching Remote folder", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const gtd = cloud.addDirectory("gtd");
+    vault.directories.add(localPath("gtd"));
+    const content = text("new\n");
+    vault.files.set(localPath("gtd/Inbox.md"), content);
+
+    const result = await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(cloud.uploadFile).toHaveBeenCalledWith(gtd.id, "Inbox.txt", content);
+    expect(result.uploaded).toEqual(["Document/Obsidian/gtd/Inbox.txt"]);
+    expect(result.baseline.entries["gtd/Inbox.md"]).toMatchObject({
+      remoteRelativePath: "gtd/Inbox.txt",
+    });
+  });
+
+  it("does not rename a Remote folder whose name ends in .txt", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const notes = cloud.addDirectory("notes.txt");
+    const content = text("inside\n");
+    addIn(cloud, notes.id, "inside.txt", content);
+
+    await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(vault.createDirectory).toHaveBeenCalledWith(localPath("notes.txt"));
+    expect(vault.files.get(localPath("notes.txt/inside.md"))).toEqual(content);
+  });
+
+  it("follows a Remote folder rename for a mapped file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const renamed = cloud.addDirectory("gtd-2026");
+    vault.directories.add(localPath("gtd"));
+    const content = text("same\n");
+    const file = addIn(cloud, renamed.id, "project.txt", content);
+    vault.files.set(localPath("gtd/project.md"), content);
+    const baseline = pairedEntry(
+      initializedBaseline(),
+      "gtd/project.md",
+      "gtd/project.txt",
+      file,
+      content,
+    );
+
+    const result = await service(vault, cloud).reconcile(baseline);
+
+    expect(vault.move).toHaveBeenCalledWith(
+      localPath("gtd/project.md"),
+      localPath("gtd-2026/project.md"),
+    );
+    expect(Object.keys(result.baseline.entries)).toEqual([
+      "gtd-2026/project.md",
+    ]);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+    expect(cloud.recycleItem).not.toHaveBeenCalled();
+  });
+
+  it("keeps both conflicting copies as .md in the Vault and .txt in the Remote", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const before = text("before\n");
+    const local = text("vault edit\n");
+    const remote = text("device edit\n");
+    const file = cloud.add("project.txt", remote);
+    vault.files.set(localPath("project.md"), local);
+    const conflicted = await service(vault, cloud).reconcile(
+      baselineFor(file, before, "project.md"),
+    );
+    expect(conflicted.conflicts).toEqual([
+      expect.objectContaining({
+        kind: "both-edited",
+        localRelativePath: "project.md",
+        remoteRelativePath: "project.txt",
+      }),
+    ]);
+
+    const resolved = await service(vault, cloud).reconcile(
+      conflicted.baseline,
+      { resolutions: { [conflicted.conflicts[0]!.id]: "keep-both" } },
+    );
+
+    const stem = `project (Vault ${checksum(local).slice(0, 8)})`;
+    expect(resolved.conflicts).toEqual([]);
+    expect(vault.files.get(localPath("project.md"))).toEqual(remote);
+    expect(vault.files.get(localPath(`${stem}.md`))).toEqual(local);
+    expect(vault.files.has(localPath(`${stem}.txt`))).toBe(false);
+    expect(uploadedNames(cloud)).toEqual([`${stem}.txt`]);
+    expect(remoteFileNames(cloud)).toEqual([`${stem}.txt`, "project.txt"]);
+    expect(resolved.baseline.entries[`${stem}.md`]).toMatchObject({
+      remoteRelativePath: `${stem}.txt`,
+    });
+  });
+
+  it("resolves a mapped conflict with the Vault copy by replacing the Remote .txt", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const before = text("before\n");
+    const local = text("vault edit\n");
+    const file = cloud.add("project.txt", text("device edit\n"));
+    vault.files.set(localPath("project.md"), local);
+    const conflicted = await service(vault, cloud).reconcile(
+      baselineFor(file, before, "project.md"),
+    );
+
+    await service(vault, cloud).reconcile(conflicted.baseline, {
+      resolutions: { [conflicted.conflicts[0]!.id]: "use-vault" },
+    });
+
+    expect(cloud.replaceFile).toHaveBeenCalledWith(file, local);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+    expect(remoteFileNames(cloud)).toEqual(["project.txt"]);
+  });
+
+  it("keeps a legacy baseline entry that tracks a Vault .txt file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    const content = text("legacy\n");
+    const file = cloud.add("legacy.txt", content);
+    vault.files.set(localPath("legacy.txt"), content);
+
+    const result = await service(vault, cloud).reconcile(
+      baselineFor(file, content),
+    );
+
+    expect(result.unchanged).toEqual(["Document/Obsidian/legacy.txt"]);
+    expect(Object.keys(result.baseline.entries)).toEqual(["legacy.txt"]);
+    expect(vault.files.has(localPath("legacy.md"))).toBe(false);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("stops when Remote .txt and .md files map to the same Vault file", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    cloud.add("project.txt", text("txt\n"));
+    cloud.add("project.md", text("md\n"));
+
+    await expect(
+      service(vault, cloud).reconcile(initializedBaseline()),
+    ).rejects.toBeInstanceOf(PairInventoryIncompleteError);
+    expect(vault.files.size).toBe(0);
+    expect(cloud.uploadFile).not.toHaveBeenCalled();
+  });
+
+  // Known bug in the current Pair mapping (docs/extension-mapping.md, 1.3):
+  // switch to `it` once the Pair blocks this case instead of uploading.
+  it.fails(
+    "does not upload a second Remote .txt when the Vault holds x.txt and a paired x.md",
+    async () => {
+      const vault = new MemoryPairVault();
+      const cloud = new MemoryPairCloud();
+      const content = text("- [ ] task\n");
+      const file = cloud.add("project.txt", content);
+      vault.files.set(localPath("project.md"), content);
+      vault.files.set(localPath("project.txt"), text("stale copy\n"));
+
+      await service(vault, cloud).reconcile(
+        baselineFor(file, content, "project.md"),
+      );
+
+      expect(cloud.uploadFile).not.toHaveBeenCalled();
+      expect(cloud.recycleItem).not.toHaveBeenCalled();
+      expect(remoteFileNames(cloud)).toEqual(["project.txt"]);
+      expect(cloud.bytes.get(file.id)).toEqual(content);
+    },
+  );
+
+  // Known bug in the current Pair mapping (docs/extension-mapping.md, 1.3):
+  // switch to `it` once the Pair blocks this case instead of uploading.
+  it.fails(
+    "does not upload a second Remote .txt on a first baseline with Vault x.txt and x.md",
+    async () => {
+      const vault = new MemoryPairVault();
+      const cloud = new MemoryPairCloud();
+      const content = text("- [ ] task\n");
+      cloud.add("project.txt", content);
+      vault.files.set(localPath("project.md"), content);
+      vault.files.set(localPath("project.txt"), text("stale copy\n"));
+
+      const first = await service(vault, cloud).reconcile(emptyPairBaseline());
+      const resolutions = Object.fromEntries(
+        first.conflicts.map((conflict) => [conflict.id, "use-vault" as const]),
+      );
+      await service(vault, cloud).reconcile(first.baseline, { resolutions });
+
+      expect(cloud.uploadFile).not.toHaveBeenCalled();
+      expect(remoteFileNames(cloud)).toEqual(["project.txt"]);
+    },
+  );
+
+  // Known bug in the current Pair mapping (docs/extension-mapping.md, 1.3):
+  // switch to `it` once the Pair blocks this case instead of uploading.
+  it.fails(
+    "does not delete the paired Remote .txt when the Vault x.md is removed but x.txt remains",
+    async () => {
+      const vault = new MemoryPairVault();
+      const cloud = new MemoryPairCloud();
+      const content = text("- [ ] task\n");
+      const file = cloud.add("project.txt", content);
+      vault.files.set(localPath("project.txt"), content);
+
+      await service(vault, cloud).reconcile(
+        baselineFor(file, content, "project.md"),
+      );
+
+      expect(cloud.recycleItem).not.toHaveBeenCalled();
+      expect(cloud.uploadFile).not.toHaveBeenCalled();
+      expect(remoteFileNames(cloud)).toEqual(["project.txt"]);
+    },
+  );
+
+  it("never uploads a file name ending in .md", async () => {
+    const vault = new MemoryPairVault();
+    const cloud = new MemoryPairCloud();
+    vault.files.set(localPath("a.md"), text("a\n"));
+    vault.files.set(localPath("B.MD"), text("b\n"));
+    vault.files.set(localPath("nested/c.md"), text("c\n"));
+
+    await service(vault, cloud).reconcile(initializedBaseline());
+
+    expect(uploadedNames(cloud).sort()).toEqual(["B.txt", "a.txt", "c.txt"]);
+    expect(uploadedNames(cloud).filter((name) => /\.md$/i.test(name))).toEqual(
+      [],
+    );
+  });
+});
